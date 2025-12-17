@@ -1,233 +1,325 @@
 import os
 import csv
 import threading
+import shutil
+import tempfile
+import subprocess
+import ctypes
+import sys
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import colorama
 from pyfiglet import Figlet
 from termcolor import colored
 from Registry import Registry
+from Registry import RegistryParse
 
-# Initialize colorama
+# --- CONFIGURATION ---
 colorama.init()
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("dark-blue")
 
-# --- BACKEND LOGIC ---
+APP_NAME = "Hive2CSV Live"
+AUTHOR = "Made By Aryan Giri"
+VERSION = "6.0 Stable"
+
+# --- HELPER FUNCTIONS ---
+
+def is_admin():
+    """Checks if the script is running with Admin privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
 def is_valid_hive(filepath):
-    """
-    Checks if a file is a valid Windows Registry Hive by reading the first 4 bytes.
-    Magic Bytes for Registry Hive = 'regf'
-    """
+    filename = os.path.basename(filepath).lower()
+    # 1. Ignore Junk
+    if filename.endswith(('.log', '.log1', '.log2', '.blf', '.sav', '.dat.log', '.jfm')):
+        return False
+    
+    # 2. Known System Hives (Always accept these even if locked)
+    if filename.upper() in ['SAM', 'SECURITY', 'SOFTWARE', 'SYSTEM', 'DEFAULT', 'NTUSER.DAT']:
+        return True
+
     try:
+        # 3. Size Check
+        if os.path.getsize(filepath) < 4096:
+            return False
+        # 4. Magic Bytes
         with open(filepath, 'rb') as f:
-            header = f.read(4)
-            return header == b'regf'
+            return f.read(4) == b'regf'
+    except PermissionError:
+        return True # Assume it's a valid locked hive
     except:
         return False
 
 def clean_data_for_ai(value_obj):
-    """Format registry data for AI ingestion."""
+    """
+    Robust cleaner that checks value types by STRING to avoid attribute errors.
+    """
     try:
-        val_type = value_obj.value_type()
+        # We use value_type_str() to get "RegBin", "RegSZ", etc. safely
+        val_type_str = value_obj.value_type_str()
         data = value_obj.value()
 
-        if val_type == Registry.RegBin:
+        # Handle Binary Data
+        if val_type_str == "RegBin":
             hex_str = data.hex(" ").upper()
-            return f"[HEX_TRUNCATED] {hex_str[:100]}..." if len(hex_str) > 100 else f"[HEX] {hex_str}"
-        elif val_type == Registry.RegMultiSz:
+            return f"[HEX] {hex_str[:100]}..." if len(hex_str) > 100 else f"[HEX] {hex_str}"
+
+        # Handle Lists (RegMultiSZ)
+        elif val_type_str == "RegMultiSZ":
             return f"[LIST] {'; '.join(data)}"
-        elif val_type in [Registry.RegDWord, Registry.RegQWord]:
+
+        # Handle Integers
+        elif val_type_str in ["RegDWord", "RegQWord"]:
             return f"[INT] {data}"
+
+        # Handle Strings (RegSZ, RegExpandSZ)
         else:
-            return str(data).strip()
-    except Exception:
-        return "[UNREADABLE]"
+            try:
+                # Force conversion to string
+                s = str(data)
+                # Remove embedded NULL bytes which break CSVs commonly
+                s = s.replace('\x00', '')
+                return s.strip()
+            except UnicodeDecodeError:
+                # If strict decoding fails, try 'latin-1' to just show raw chars
+                return f"[RAW_LATIN] {str(data).encode('utf-8', 'replace').decode('latin-1')}"
+            except Exception as e:
+                return f"[STRING_ERROR] {str(e)}"
+
+    except Exception as e:
+        # If the library itself fails to parse the value
+        return f"[PARSE_ERROR] {str(e)}"
 
 def walk_hive(key, csv_writer, source_name, path_prefix=""):
-    """Recursively walks the hive."""
     current_path = f"{path_prefix}\\{key.name()}"
     try:
         timestamp = key.timestamp().isoformat()
     except:
         timestamp = "UNKNOWN"
 
-    # Write values
     for value in key.values():
         try:
-            row = [
-                source_name,            # Context: Which Hive file?
-                timestamp,              # Context: Time
-                current_path,           # Context: Location
-                value.name(),           # Context: Value Name
-                value.value_type_str(), # Context: Type
-                clean_data_for_ai(value)# Context: Data
-            ]
+            row = [source_name, timestamp, current_path, value.name(), value.value_type_str(), clean_data_for_ai(value)]
             csv_writer.writerow(row)
-        except Exception:
-            pass
-
-    # Recurse
+        except:
+            continue
     for subkey in key.subkeys():
         walk_hive(subkey, csv_writer, source_name, current_path)
 
-# --- GUI CLASS ---
+def force_export_hive(filepath, temp_dest):
+    """
+    Uses Windows 'reg save' command to export locked system hives.
+    """
+    filename = os.path.basename(filepath).upper()
+    cmd = None
+
+    # Map filename to Registry Mount Point
+    if filename == 'SAM':
+        cmd = f'reg save HKLM\\SAM "{temp_dest}" -y'
+    elif filename == 'SECURITY':
+        cmd = f'reg save HKLM\\SECURITY "{temp_dest}" -y'
+    elif filename == 'SOFTWARE':
+        cmd = f'reg save HKLM\\SOFTWARE "{temp_dest}" -y'
+    elif filename == 'SYSTEM':
+        cmd = f'reg save HKLM\\SYSTEM "{temp_dest}" -y'
+    elif filename == 'DEFAULT':
+        cmd = f'reg save HKU\\.DEFAULT "{temp_dest}" -y'
+    elif filename == 'NTUSER.DAT':
+        if os.environ['USERPROFILE'] in filepath:
+             cmd = f'reg save HKCU "{temp_dest}" -y'
+    
+    if cmd:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        result = subprocess.run(cmd, startupinfo=startupinfo, shell=True, capture_output=True)
+        return result.returncode == 0
+    
+    return False
+
+# --- GUI ---
 
 class HiveToCSVApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-
-        # Window Setup
-        self.title("Hive2CSV - Forensics Tool")
-        self.geometry("700x600")
-        ctk.set_appearance_mode("Dark")
-        ctk.set_default_color_theme("blue")
-
-        # Data
+        self.title(f"{APP_NAME} - {VERSION}")
+        self.geometry("1000x700")
         self.selected_files = []
+        self.build_ui()
 
-        # UI Layout
-        self.create_widgets()
+        if not is_admin():
+            messagebox.showwarning("Admin Required", "To export LOCKED files (SAM, SYSTEM), you must restart this tool as Administrator!")
+            self.log("[!] WARNING: Not running as Admin. Locked files will fail.")
 
-    def create_widgets(self):
-        # Title
-        self.label_title = ctk.CTkLabel(self, text="Hive2CSV", font=("Roboto Medium", 30))
-        self.label_title.pack(pady=(20, 5))
+    def build_ui(self):
+        # Sidebar
+        self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0)
+        self.sidebar.pack(side="left", fill="y")
+        
+        ctk.CTkLabel(self.sidebar, text="Hive2CSV", font=("Roboto Medium", 30)).pack(pady=(40, 5))
+        ctk.CTkLabel(self.sidebar, text=AUTHOR, font=("Roboto", 12), text_color="#FFD700").pack(pady=(0, 30))
 
-        # Credits
-        self.label_credits = ctk.CTkLabel(self, text="Made By Aryan Giri", text_color="yellow", font=("Roboto", 12))
-        self.label_credits.pack(pady=(0, 20))
+        self.btn_files = ctk.CTkButton(self.sidebar, text="📂 Load Specific Files", command=self.browse_files)
+        self.btn_files.pack(padx=20, pady=10, fill="x")
 
-        # --- Button Frame ---
-        self.frame_buttons = ctk.CTkFrame(self)
-        self.frame_buttons.pack(pady=10)
+        self.btn_folder = ctk.CTkButton(self.sidebar, text="🔍 Auto-Scan Directory", command=self.scan_directory_ui, fg_color="#D35400")
+        self.btn_folder.pack(padx=20, pady=10, fill="x")
 
-        # File Selection Button
-        self.btn_select = ctk.CTkButton(self.frame_buttons, text="Select Specific Files", command=self.select_files)
-        self.btn_select.grid(row=0, column=0, padx=10)
+        self.btn_here = ctk.CTkButton(self.sidebar, text="📍 Scan Current Folder", command=self.scan_here, fg_color="#2C3E50")
+        self.btn_here.pack(padx=20, pady=10, fill="x")
 
-        # AUTO SCAN Button (New Feature)
-        self.btn_scan = ctk.CTkButton(self.frame_buttons, text="Auto-Find Hives in Folder", command=self.scan_directory, fg_color="orange")
-        self.btn_scan.grid(row=0, column=1, padx=10)
+        # Main Area
+        self.main_area = ctk.CTkFrame(self, corner_radius=10)
+        self.main_area.pack(side="right", fill="both", expand=True, padx=20, pady=20)
 
-        # File List Display
-        self.label_list = ctk.CTkLabel(self, text="Files to Process:", anchor="w")
-        self.label_list.pack(pady=(10, 0), padx=50, fill="x")
+        self.lbl_status = ctk.CTkLabel(self.main_area, text="Status: Ready", font=("Roboto", 16), anchor="w")
+        self.lbl_status.pack(pady=(20, 10), padx=20, fill="x")
 
-        self.textbox_files = ctk.CTkTextbox(self, width=600, height=200)
-        self.textbox_files.pack(pady=5)
-        self.textbox_files.insert("0.0", "No files loaded yet...\n")
-        self.textbox_files.configure(state="disabled")
+        self.console = ctk.CTkTextbox(self.main_area, width=600, height=300, font=("Consolas", 12))
+        self.console.pack(pady=10, padx=20, fill="both", expand=True)
+        self.console.configure(state="disabled")
 
-        # Convert Button
-        self.btn_convert = ctk.CTkButton(self, text="LOAD ALL & ANALYZE", command=self.start_conversion, fg_color="green", height=50, font=("Roboto Medium", 16))
-        self.btn_convert.pack(pady=20)
+        self.lbl_progress = ctk.CTkLabel(self.main_area, text="Progress: 0%")
+        self.lbl_progress.pack(pady=(5,0))
+        self.progress_bar = ctk.CTkProgressBar(self.main_area)
+        self.progress_bar.set(0)
+        self.progress_bar.pack(pady=10, padx=50, fill="x")
 
-        # Status Label
-        self.label_status = ctk.CTkLabel(self, text="Ready", text_color="gray")
-        self.label_status.pack(pady=5)
+        self.btn_run = ctk.CTkButton(self.main_area, text="🚀 START ANALYSIS", command=self.start_processing, height=60, font=("Roboto", 18, "bold"), fg_color="#27AE60")
+        self.btn_run.pack(pady=20, padx=50, fill="x")
 
-    def select_files(self):
-        files = filedialog.askopenfilenames(title="Select Registry Hives")
+    def log(self, message):
+        self.console.configure(state="normal")
+        self.console.insert("end", f"{message}\n")
+        self.console.see("end")
+        self.console.configure(state="disabled")
+
+    def browse_files(self):
+        files = filedialog.askopenfilenames()
         if files:
-            # Add new files to existing list without duplicates
             for f in files:
                 if f not in self.selected_files:
                     self.selected_files.append(f)
-            self.update_file_list()
-            self.label_status.configure(text=f"{len(self.selected_files)} files queued.")
+            self.refresh_list()
 
-    def scan_directory(self):
-        """Scans a directory recursively for files with 'regf' header."""
-        folder_selected = filedialog.askdirectory(title="Select Folder to Scan")
-        if not folder_selected:
-            return
+    def scan_here(self):
+        self.run_scanner(os.getcwd())
 
-        self.label_status.configure(text="Scanning folder for hives... please wait.")
-        self.update() # Force UI refresh
+    def scan_directory_ui(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.run_scanner(folder)
 
-        found_count = 0
-        for root, dirs, files in os.walk(folder_selected):
+    def run_scanner(self, folder):
+        self.lbl_status.configure(text=f"Scanning: {os.path.basename(folder)}...")
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start()
+        threading.Thread(target=self.thread_scanner, args=(folder,)).start()
+
+    def thread_scanner(self, start_dir):
+        count = 0
+        for root, dirs, files in os.walk(start_dir):
             for file in files:
                 full_path = os.path.join(root, file)
-                # Check magic bytes to see if it's a real hive
                 if is_valid_hive(full_path):
                     if full_path not in self.selected_files:
                         self.selected_files.append(full_path)
-                        found_count += 1
-        
-        self.update_file_list()
-        if found_count > 0:
-            messagebox.showinfo("Scan Complete", f"Found {found_count} valid Registry Hives!")
-            self.label_status.configure(text=f"Scan complete. {len(self.selected_files)} files ready.")
-        else:
-            messagebox.showwarning("Scan Complete", "No valid Registry Hives found in that folder.")
-            self.label_status.configure(text="No hives found.")
+                        count += 1
+                        self.log(f"[+] FOUND: {file}")
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
+        self.progress_bar.set(0)
+        self.lbl_status.configure(text=f"Scan Complete. Found {count} hives.")
 
-    def update_file_list(self):
-        self.textbox_files.configure(state="normal")
-        self.textbox_files.delete("0.0", "end")
+    def refresh_list(self):
+        self.console.configure(state="normal")
+        self.console.delete("0.0", "end")
         for f in self.selected_files:
-            self.textbox_files.insert("end", f"[{os.path.basename(f)}] -> {f}\n")
-        self.textbox_files.configure(state="disabled")
+            self.console.insert("end", f"[*] {os.path.basename(f)}\n")
+        self.console.configure(state="disabled")
 
-    def start_conversion(self):
+    def start_processing(self):
         if not self.selected_files:
-            messagebox.showwarning("Warning", "Please load at least one hive file first.")
+            messagebox.showwarning("Warning", "No files loaded.")
             return
-
-        self.btn_convert.configure(state="disabled")
-        self.btn_scan.configure(state="disabled")
-        self.btn_select.configure(state="disabled")
         
-        # Run in separate thread
-        threading.Thread(target=self.process_hives_thread).start()
+        if not is_admin():
+            self.log("[!] NOTE: Not running as Admin. Locked files may fail.")
 
-    def process_hives_thread(self):
-        output_csv = "merged_registry_analysis.csv"
+        self.btn_run.configure(state="disabled", text="PROCESSING...", fg_color="gray")
+        threading.Thread(target=self.thread_processor).start()
+
+    def thread_processor(self):
+        output_csv = "hive_analysis_result.csv"
+        temp_dir = tempfile.mkdtemp()
+        total = len(self.selected_files)
+        success = 0
         
         try:
-            with open(output_csv, mode='w', newline='', encoding='utf-8') as f:
+            with open(output_csv, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Source_Hive", "Last_Modified", "Key_Path", "Value_Name", "Type", "Data"])
+                writer.writerow(["Source_Hive", "Last_Modified", "Key_Path", "Value_Name", "Data_Type", "Data"])
 
-                total = len(self.selected_files)
-                for index, file_path in enumerate(self.selected_files):
-                    file_name = os.path.basename(file_path)
+                for idx, filepath in enumerate(self.selected_files):
+                    filename = os.path.basename(filepath)
+                    self.lbl_status.configure(text=f"Processing: {filename}")
                     
-                    # Update GUI
-                    self.label_status.configure(text=f"Processing ({index+1}/{total}): {file_name}...")
+                    working_path = filepath
                     
+                    # --- COPY LOGIC ---
                     try:
-                        reg = Registry.Registry(file_path)
-                        walk_hive(reg.root(), writer, file_name)
+                        temp_path = os.path.join(temp_dir, f"copy_{filename}")
+                        shutil.copy2(filepath, temp_path)
+                        working_path = temp_path
+                    except PermissionError:
+                        self.log(f"[*] LOCKED: {filename}. Attempting Admin Export...")
+                        if force_export_hive(filepath, temp_path):
+                            self.log(f"[+] EXPORT SUCCESS: {filename}")
+                            working_path = temp_path
+                        else:
+                            self.log(f"[!] FAILED to export {filename}. (Requires Admin)")
+                            continue
                     except Exception as e:
-                        print(f"Failed to parse {file_name}: {e}")
+                        self.log(f"[!] Copy Error: {e}")
+                        continue
 
-            self.label_status.configure(text=f"Done! Output: {output_csv}", text_color="green")
-            messagebox.showinfo("Success", f"Analysis Complete!\nProcessed {total} hives.\nSaved to: {output_csv}")
+                    # --- PARSE LOGIC ---
+                    try:
+                        reg = Registry.Registry(working_path)
+                        walk_hive(reg.root(), writer, filename)
+                        success += 1
+                    except RegistryParse.ParseException:
+                        self.log(f"[-] SKIP: {filename} (Corrupt/Empty)")
+                    except Exception as e:
+                        self.log(f"[!] PARSE ERROR: {filename}")
+
+                    self.progress_bar.set((idx + 1) / total)
+                    self.lbl_progress.configure(text=f"Progress: {int(((idx + 1) / total) * 100)}%")
+
+            self.lbl_status.configure(text=f"Done! Processed {success}/{total} hives.")
+            self.log(f"[DONE] Saved to: {os.path.abspath(output_csv)}")
+            messagebox.showinfo("Success", f"Analysis Complete!\nSaved to: {output_csv}")
 
         except Exception as e:
-            self.label_status.configure(text=f"Error: {e}", text_color="red")
+            messagebox.showerror("Fatal Error", str(e))
         
         finally:
-            self.btn_convert.configure(state="normal")
-            self.btn_scan.configure(state="normal")
-            self.btn_select.configure(state="normal")
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+            self.btn_run.configure(state="normal", text="🚀 START ANALYSIS", fg_color="#27AE60")
 
-# --- MAIN ENTRY ---
-
-def main():
-    # Terminal Banner
+if __name__ == "__main__":
     os.system('cls' if os.name == 'nt' else 'clear')
     f = Figlet(font='slant')
     print(colored(f.renderText('Hive2CSV'), 'cyan', attrs=['bold']))
-    print(colored("--- Automated Forensics Tool ---", 'white'))
-    print(colored("Made By Aryan Giri", 'yellow', attrs=['bold']))
+    print(colored(f"--- {VERSION} ---", 'white'))
+    print(colored(AUTHOR, 'yellow'))
     print("\n")
 
-    # Launch GUI
     app = HiveToCSVApp()
     app.mainloop()
-
-if __name__ == "__main__":
-    main()
