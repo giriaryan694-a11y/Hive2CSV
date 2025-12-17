@@ -13,6 +13,18 @@ colorama.init()
 
 # --- BACKEND LOGIC ---
 
+def is_valid_hive(filepath):
+    """
+    Checks if a file is a valid Windows Registry Hive by reading the first 4 bytes.
+    Magic Bytes for Registry Hive = 'regf'
+    """
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(4)
+            return header == b'regf'
+    except:
+        return False
+
 def clean_data_for_ai(value_obj):
     """Format registry data for AI ingestion."""
     try:
@@ -34,7 +46,10 @@ def clean_data_for_ai(value_obj):
 def walk_hive(key, csv_writer, source_name, path_prefix=""):
     """Recursively walks the hive."""
     current_path = f"{path_prefix}\\{key.name()}"
-    timestamp = key.timestamp().isoformat()
+    try:
+        timestamp = key.timestamp().isoformat()
+    except:
+        timestamp = "UNKNOWN"
 
     # Write values
     for value in key.values():
@@ -63,7 +78,7 @@ class HiveToCSVApp(ctk.CTk):
 
         # Window Setup
         self.title("Hive2CSV - Forensics Tool")
-        self.geometry("600x500")
+        self.geometry("700x600")
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
@@ -82,18 +97,29 @@ class HiveToCSVApp(ctk.CTk):
         self.label_credits = ctk.CTkLabel(self, text="Made By Aryan Giri", text_color="yellow", font=("Roboto", 12))
         self.label_credits.pack(pady=(0, 20))
 
+        # --- Button Frame ---
+        self.frame_buttons = ctk.CTkFrame(self)
+        self.frame_buttons.pack(pady=10)
+
         # File Selection Button
-        self.btn_select = ctk.CTkButton(self, text="Select Hive Files (Multi-Select)", command=self.select_files)
-        self.btn_select.pack(pady=10)
+        self.btn_select = ctk.CTkButton(self.frame_buttons, text="Select Specific Files", command=self.select_files)
+        self.btn_select.grid(row=0, column=0, padx=10)
+
+        # AUTO SCAN Button (New Feature)
+        self.btn_scan = ctk.CTkButton(self.frame_buttons, text="Auto-Find Hives in Folder", command=self.scan_directory, fg_color="orange")
+        self.btn_scan.grid(row=0, column=1, padx=10)
 
         # File List Display
-        self.textbox_files = ctk.CTkTextbox(self, width=500, height=150)
-        self.textbox_files.pack(pady=10)
-        self.textbox_files.insert("0.0", "No files selected...\n")
+        self.label_list = ctk.CTkLabel(self, text="Files to Process:", anchor="w")
+        self.label_list.pack(pady=(10, 0), padx=50, fill="x")
+
+        self.textbox_files = ctk.CTkTextbox(self, width=600, height=200)
+        self.textbox_files.pack(pady=5)
+        self.textbox_files.insert("0.0", "No files loaded yet...\n")
         self.textbox_files.configure(state="disabled")
 
         # Convert Button
-        self.btn_convert = ctk.CTkButton(self, text="Analyze & Convert to CSV", command=self.start_conversion, fg_color="green")
+        self.btn_convert = ctk.CTkButton(self, text="LOAD ALL & ANALYZE", command=self.start_conversion, fg_color="green", height=50, font=("Roboto Medium", 16))
         self.btn_convert.pack(pady=20)
 
         # Status Label
@@ -103,26 +129,57 @@ class HiveToCSVApp(ctk.CTk):
     def select_files(self):
         files = filedialog.askopenfilenames(title="Select Registry Hives")
         if files:
-            self.selected_files = list(files)
+            # Add new files to existing list without duplicates
+            for f in files:
+                if f not in self.selected_files:
+                    self.selected_files.append(f)
             self.update_file_list()
-            self.label_status.configure(text=f"{len(files)} files selected.")
+            self.label_status.configure(text=f"{len(self.selected_files)} files queued.")
+
+    def scan_directory(self):
+        """Scans a directory recursively for files with 'regf' header."""
+        folder_selected = filedialog.askdirectory(title="Select Folder to Scan")
+        if not folder_selected:
+            return
+
+        self.label_status.configure(text="Scanning folder for hives... please wait.")
+        self.update() # Force UI refresh
+
+        found_count = 0
+        for root, dirs, files in os.walk(folder_selected):
+            for file in files:
+                full_path = os.path.join(root, file)
+                # Check magic bytes to see if it's a real hive
+                if is_valid_hive(full_path):
+                    if full_path not in self.selected_files:
+                        self.selected_files.append(full_path)
+                        found_count += 1
+        
+        self.update_file_list()
+        if found_count > 0:
+            messagebox.showinfo("Scan Complete", f"Found {found_count} valid Registry Hives!")
+            self.label_status.configure(text=f"Scan complete. {len(self.selected_files)} files ready.")
+        else:
+            messagebox.showwarning("Scan Complete", "No valid Registry Hives found in that folder.")
+            self.label_status.configure(text="No hives found.")
 
     def update_file_list(self):
         self.textbox_files.configure(state="normal")
         self.textbox_files.delete("0.0", "end")
         for f in self.selected_files:
-            self.textbox_files.insert("end", f"{os.path.basename(f)}\n")
+            self.textbox_files.insert("end", f"[{os.path.basename(f)}] -> {f}\n")
         self.textbox_files.configure(state="disabled")
 
     def start_conversion(self):
         if not self.selected_files:
-            messagebox.showwarning("Warning", "Please select at least one hive file.")
+            messagebox.showwarning("Warning", "Please load at least one hive file first.")
             return
 
         self.btn_convert.configure(state="disabled")
-        self.label_status.configure(text="Processing... Please wait.")
+        self.btn_scan.configure(state="disabled")
+        self.btn_select.configure(state="disabled")
         
-        # Run in separate thread to keep GUI responsive
+        # Run in separate thread
         threading.Thread(target=self.process_hives_thread).start()
 
     def process_hives_thread(self):
@@ -131,14 +188,14 @@ class HiveToCSVApp(ctk.CTk):
         try:
             with open(output_csv, mode='w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                # Header now includes 'Source_Hive'
                 writer.writerow(["Source_Hive", "Last_Modified", "Key_Path", "Value_Name", "Type", "Data"])
 
-                for file_path in self.selected_files:
+                total = len(self.selected_files)
+                for index, file_path in enumerate(self.selected_files):
                     file_name = os.path.basename(file_path)
                     
-                    # Update GUI from thread
-                    self.label_status.configure(text=f"Parsing: {file_name}...")
+                    # Update GUI
+                    self.label_status.configure(text=f"Processing ({index+1}/{total}): {file_name}...")
                     
                     try:
                         reg = Registry.Registry(file_path)
@@ -146,23 +203,25 @@ class HiveToCSVApp(ctk.CTk):
                     except Exception as e:
                         print(f"Failed to parse {file_name}: {e}")
 
-            self.label_status.configure(text=f"Done! Saved to {output_csv}", text_color="green")
-            messagebox.showinfo("Success", f"Analysis Complete!\nSaved to: {output_csv}")
+            self.label_status.configure(text=f"Done! Output: {output_csv}", text_color="green")
+            messagebox.showinfo("Success", f"Analysis Complete!\nProcessed {total} hives.\nSaved to: {output_csv}")
 
         except Exception as e:
             self.label_status.configure(text=f"Error: {e}", text_color="red")
         
         finally:
             self.btn_convert.configure(state="normal")
+            self.btn_scan.configure(state="normal")
+            self.btn_select.configure(state="normal")
 
 # --- MAIN ENTRY ---
 
 def main():
-    # Terminal Banner (Requested Feature)
+    # Terminal Banner
     os.system('cls' if os.name == 'nt' else 'clear')
     f = Figlet(font='slant')
     print(colored(f.renderText('Hive2CSV'), 'cyan', attrs=['bold']))
-    print(colored("--- GUI Mode Launched ---", 'white'))
+    print(colored("--- Automated Forensics Tool ---", 'white'))
     print(colored("Made By Aryan Giri", 'yellow', attrs=['bold']))
     print("\n")
 
